@@ -543,6 +543,8 @@ impl TerminalView {
     /// gets each file copied there first (`hc put`), and its path there.
     fn dropped(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         if !self.address.contains('/') {
+            // A remote drop is read by `hc put`, which the app starts and macOS lets read it.
+            let paths = if cfg!(target_os = "macos") { paths.into_iter().map(readable_drop).collect() } else { paths };
             let text = quote_paths(paths.iter().map(|p| p.to_string_lossy().into_owned()));
             let bytes = self.grid.borrow().vt.paste_bytes(&text);
             return self.send(&bytes);
@@ -1049,6 +1051,35 @@ fn quote_paths(paths: impl IntoIterator<Item = String>) -> String {
     let mut out: String = paths.into_iter().map(quote).collect::<Vec<_>>().join(" ");
     out.push(' ');
     out
+}
+
+/// A dragged screenshot thumbnail arrives on macOS as a file in an item
+/// replacement folder (`…/TemporaryItems/NSIRD_screencaptureui_…/`) that only
+/// the app receiving the drop may read. Terminals run under herdr-core, so
+/// their programs can't open it: such a file is copied into a folder of its
+/// own in the temp dir, keeping its name, and the copy's path is typed.
+fn readable_drop(path: std::path::PathBuf) -> std::path::PathBuf {
+    if drop_only(&path) { stage_drop(&path, &std::env::temp_dir()).unwrap_or(path) } else { path }
+}
+
+/// A path inside an item replacement folder, readable only by the drop's receiver.
+fn drop_only(path: &std::path::Path) -> bool {
+    let mut parts = path.components().map(|c| c.as_os_str().to_string_lossy());
+    parts.any(|c| c == "TemporaryItems") && parts.any(|c| c.starts_with("NSIRD_"))
+}
+
+fn stage_drop(path: &std::path::Path, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let folder = dir.join(format!("herdr-drop-{stamp}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir(&folder).ok()?;
+    let copy = folder.join(name);
+    if std::fs::copy(path, &copy).is_err() {
+        let _ = std::fs::remove_dir_all(&folder);
+        return None;
+    }
+    Some(copy)
 }
 
 /// Files on the clipboard: their text is only the bare path, which an agent
@@ -3136,6 +3167,37 @@ mod tests {
         assert_eq!(q(&["/tmp/shot.png"]), "/tmp/shot.png ");
         assert_eq!(q(&["/tmp/my shot.png", "/a/b"]), "'/tmp/my shot.png' /a/b ");
         assert_eq!(q(&["/tmp/it's.png"]), "'/tmp/it'\\''s.png' ");
+    }
+
+    #[test]
+    fn a_dropped_screenshot_thumbnail_is_typed_as_a_copy_its_program_can_read() {
+        use std::path::Path;
+        let shot = "/var/folders/4d/x/T/TemporaryItems/NSIRD_screencaptureui_RtA5hu/Screenshot 2026-11-04 at 8.52.10\u{202f}AM.png";
+        assert!(super::drop_only(Path::new(shot)));
+        assert!(!super::drop_only(Path::new("/Users/me/Desktop/Screenshot.png")));
+        assert!(!super::drop_only(Path::new("/Users/me/NSIRD_notes/TemporaryItems/a.png")));
+
+        // macOS guards folders named TemporaryItems, so a real one couldn't be cleaned up.
+        let root = std::env::temp_dir().join(format!("herdr-drop-test-{}", std::process::id()));
+        let from = root.join("NSIRD_screencaptureui_x");
+        std::fs::create_dir_all(&from).unwrap();
+        let file = from.join("Screenshot at 8.52\u{202f}AM.png");
+        std::fs::write(&file, b"png").unwrap();
+        let copy = super::stage_drop(&file, &root).unwrap();
+        assert_eq!(copy.file_name(), file.file_name());
+        assert_ne!(copy.parent(), file.parent());
+        assert_eq!(std::fs::read(&copy).unwrap(), b"png");
+        // Two drops at once get folders of their own.
+        let again = super::stage_drop(&file, &root).unwrap();
+        assert_ne!(again.parent(), copy.parent());
+        // A file that can't be copied leaves no folder behind, and its own path is typed.
+        assert_eq!(super::stage_drop(&from.join("gone.png"), &root), None);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 3);
+        let gone = Path::new("/nowhere/TemporaryItems/NSIRD_x/gone.png").to_path_buf();
+        assert_eq!(super::readable_drop(gone.clone()), gone);
+        let plain = Path::new("/Users/me/Desktop/Screenshot.png").to_path_buf();
+        assert_eq!(super::readable_drop(plain.clone()), plain);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
